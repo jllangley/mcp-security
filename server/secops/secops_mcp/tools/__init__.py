@@ -27,6 +27,7 @@ from .search import *
 from .security_alerts import *
 from .security_events import *
 from .security_rules import *
+from .stats import *
 from .threat_intel import *
 from .udm_search import *
 from .watchlist_management import *

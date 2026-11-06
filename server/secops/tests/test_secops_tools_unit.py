@@ -5,6 +5,7 @@ import os
 import pytest
 from unittest.mock import MagicMock, patch
 from datetime import datetime, timezone, timedelta
+from typing import Optional, get_type_hints
 
 # Ensure server/secops is in path to import secops_mcp
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -46,6 +47,7 @@ from secops_mcp.tools.search import search_udm
 from secops_mcp.tools.udm_search import export_udm_search_csv
 from secops_mcp.tools.security_events import search_security_events
 from secops_mcp.tools.security_rules import get_rule_detections, test_rule as secops_test_rule
+from secops_mcp.tools.stats import get_stats
 
 @pytest.fixture
 def mock_chronicle_client():
@@ -54,6 +56,14 @@ def mock_chronicle_client():
     client.search_udm.return_value = {"total_events": 0, "events": []}
     client.fetch_udm_search_csv.return_value = {"csv": {"row": []}}
     client.translate_nl_to_udm.return_value = "metadata.event_type = 'USER_LOGIN'"
+    client.get_stats.return_value = {
+        "columns": ["metadata.event_type", "event_count"],
+        "rows": [
+            {"metadata.event_type": "USER_LOGIN", "event_count": 150},
+            {"metadata.event_type": "NETWORK_CONNECTION", "event_count": 42},
+        ],
+        "total_rows": 2,
+    }
     return client
 
 @pytest.fixture
@@ -61,7 +71,8 @@ def mock_get_client(mock_chronicle_client):
     with patch('secops_mcp.tools.search.get_chronicle_client', return_value=mock_chronicle_client) as m1, \
          patch('secops_mcp.tools.udm_search.get_chronicle_client', return_value=mock_chronicle_client) as m2, \
          patch('secops_mcp.tools.security_events.get_chronicle_client', return_value=mock_chronicle_client) as m3, \
-         patch('secops_mcp.tools.security_rules.get_chronicle_client', return_value=mock_chronicle_client):
+         patch('secops_mcp.tools.security_rules.get_chronicle_client', return_value=mock_chronicle_client), \
+         patch('secops_mcp.tools.stats.get_chronicle_client', return_value=mock_chronicle_client):
         yield mock_chronicle_client
 
 
@@ -338,4 +349,126 @@ async def test_test_rule_buffers_end_time_to_start_of_hour(mock_get_client):
     # Check output contains detection summary
     assert "Total Detections: 1" in result
     assert "Rule successfully detected 1 event(s)" in result
+
+
+# ---------------------------------------------------------------------------
+# Stats tool tests
+# ---------------------------------------------------------------------------
+
+_YARA_L_STATS_QUERY = """metadata.event_type != ""
+match:
+    metadata.event_type
+outcome:
+    $event_count = count(metadata.id)
+"""
+
+
+def test_get_stats_nullable_scope_annotations():
+    """project_id, customer_id, and region accept null in the tool schema."""
+    hints = get_type_hints(get_stats)
+    assert hints["project_id"] == Optional[str]
+    assert hints["customer_id"] == Optional[str]
+    assert hints["region"] == Optional[str]
+
+
+@pytest.mark.asyncio
+async def test_get_stats_returns_structured_result(mock_get_client):
+    """Stats results contain typed columns, rows, and total_rows."""
+    result = await get_stats(
+        query=_YARA_L_STATS_QUERY,
+        hours_back=24,
+        project_id="test",
+        customer_id="test",
+    )
+
+    assert "error" not in result, f"Unexpected error: {result.get('error')}"
+    assert result["total_rows"] == 2
+    assert result["columns"] == ["metadata.event_type", "event_count"]
+    assert len(result["rows"]) == 2
+    # Outcome aliases are returned without the leading $.
+    login_row = next(r for r in result["rows"] if r["metadata.event_type"] == "USER_LOGIN")
+    assert login_row["event_count"] == 150
+
+
+@pytest.mark.asyncio
+async def test_get_stats_passes_correct_time_range(mock_get_client):
+    """Explicit ISO start/end times are parsed and forwarded as datetime objects."""
+    result = await get_stats(
+        query=_YARA_L_STATS_QUERY,
+        start_time="2024-03-01T00:00:00Z",
+        end_time="2024-03-02T00:00:00Z",
+        project_id="test",
+        customer_id="test",
+    )
+
+    assert "error" not in result
+    call_args = mock_get_client.get_stats.call_args
+    _, kwargs = call_args
+    assert isinstance(kwargs["start_time"], datetime)
+    assert kwargs["start_time"].year == 2024
+    assert kwargs["start_time"].month == 3
+    assert kwargs["start_time"].day == 1
+    assert isinstance(kwargs["end_time"], datetime)
+    assert kwargs["end_time"].day == 2
+
+
+@pytest.mark.asyncio
+async def test_get_stats_passes_max_values_param(mock_get_client):
+    """max_values is forwarded; legacy stats controls are not."""
+    query = """principal.ip != ""
+match:
+    principal.ip
+outcome:
+    $event_count = count(metadata.id)
+"""
+    await get_stats(
+        query=query,
+        max_values=100,
+        project_id="test",
+        customer_id="test",
+    )
+
+    call_kwargs = mock_get_client.get_stats.call_args[1]
+    assert call_kwargs["query"] == query
+    assert call_kwargs["max_values"] == 100
+    assert call_kwargs["timeout"] == 120
+    assert "max_events" not in call_kwargs
+    assert "case_insensitive" not in call_kwargs
+
+
+@pytest.mark.asyncio
+async def test_get_stats_invalid_date_returns_error(mock_get_client):
+    """Invalid ISO date returns error dict — not an exception."""
+    result = await get_stats(
+        query=_YARA_L_STATS_QUERY,
+        start_time="not-a-date",
+        project_id="test",
+        customer_id="test",
+    )
+
+    assert "error" in result
+    assert "Error parsing date format" in result["error"]
+    assert result["columns"] == []
+    assert result["rows"] == []
+    assert result["total_rows"] == 0
+    # Chronicle client must NOT have been called on a bad date
+    mock_get_client.get_stats.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_stats_api_error_returns_error_dict(mock_get_client):
+    """A runtime exception from the Chronicle client surfaces as an error dict."""
+    mock_get_client.get_stats.side_effect = Exception("Chronicle API unavailable")
+
+    result = await get_stats(
+        query=_YARA_L_STATS_QUERY,
+        project_id="test",
+        customer_id="test",
+    )
+
+    assert "error" in result
+    assert "Chronicle API unavailable" in result["error"]
+    assert result["columns"] == []
+    assert result["rows"] == []
+    assert result["total_rows"] == 0
 
